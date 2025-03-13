@@ -4,4 +4,5 @@ This repo is created as a part of the course IS 698 - Cloud computing and manage
 
 It has the scripts from Lab 3. 
 - Lab 3 - S3 and Boto3.
+- Lab 5 - Dynamodb and RDS
 - Lab 6 - Resource (EC2, S3, VPC) management using Terraform
