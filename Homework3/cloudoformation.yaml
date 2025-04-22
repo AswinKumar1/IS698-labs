@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: HW3 - VPC, EC2, S3 + Lambda Trigger with Best Practices
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Environment name for tagging
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: is698-homework3
+    Description: EC2 KeyPair to SSH
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+    Description: EC2 instance type
+
+  CreateEC2:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: Whether to create EC2 instance (true/false)
+
+Mappings:
+  RegionMap:
+    us-east-2:
+      AMI: ami-01225f5f7fd1eedca
+
+Conditions:
+  ShouldCreateEC2: !Equals
+    - !Ref CreateEC2
+    - true
+
+Resources:
+  # VPC and networking
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ""
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ""
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # EC2
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateEC2
+    Properties:
+      GroupDescription: Allow SSH, HTTP, HTTPS
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Condition: ShouldCreateEC2
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap
+        - RegionMap
+        - !Ref AWS::Region
+        - AMI
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-webserver
+
+  # S3
+  MyS3Bucket:
+    Type: AWS::S3::Bucket
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub ${MyS3Bucket.Arn}/*
+
+  # Lambda Function
+  S3LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              print("S3 Event Received:", event)
+              return {"statusCode": 200}
+
+  # Permission for S3 to trigger Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt MyS3Bucket.Arn
+
+  # Custom Lambda to set S3 trigger (breaks circular dependency)
+  S3NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3NotifyPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutBucketNotification
+                Resource: !Sub arn:aws:s3:::${MyS3Bucket}
+              - Effect: Allow
+                Action: logs:*
+                Resource: arn:aws:logs:*:*:*
+
+  S3NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt S3NotificationLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              props = event['ResourceProperties']
+              s3.put_bucket_notification_configuration(
+                  Bucket=props['Bucket'],
+                  NotificationConfiguration={
+                      'LambdaFunctionConfigurations': [{
+                          'LambdaFunctionArn': props['LambdaFunctionArn'],
+                          'Events': ['s3:ObjectCreated:*']
+                      }]
+                  }
+              )
+              return {"Status": "SUCCESS", "PhysicalResourceId": props['Bucket']}
+
+  S3NotificationCustomResource:
+    Type: Custom::S3BucketNotification
+    DependsOn: LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt S3NotificationLambda.Arn
+      Bucket: !Ref MyS3Bucket
+      LambdaFunctionArn: !GetAtt S3LambdaFunction.Arn
+
+Outputs:
+  VPCId:
+    Description: The ID of the created VPC
+    Value: !Ref MyVPC
+
+  EC2PublicIP:
+    Condition: ShouldCreateEC2
+    Description: The public IP of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+
+  S3BucketName:
+    Description: The name of the S3 bucket
+    Value: !Ref MyS3Bucket
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function triggered by S3
+    Value: !Ref S3LambdaFunction
